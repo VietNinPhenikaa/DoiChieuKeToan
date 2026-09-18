@@ -1,0 +1,7 @@
+Flask
+pandas
+openpyxl
+rapidfuzz
+werkzeug
+xlrd>=2.0.1
+gunicorn
