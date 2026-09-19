@@ -5,3 +5,5 @@ rapidfuzz
 werkzeug
 xlrd>=2.0.1
 gunicorn
+lxml
+html5lib
