@@ -26,7 +26,9 @@ def create_virtual_acc(records):
 def match_transactions(bank_records, acc_records):
     results = []
     
+    # ==========================================================
     # TẦNG 1: KHỚP 1-1
+    # ==========================================================
     for b in bank_records:
         if b['matched']: continue
         candidates = []
@@ -44,7 +46,7 @@ def match_transactions(bank_records, acc_records):
                 results.append(create_result_row('ĐÚNG', b, best_acc, best_score, ''))
                 
     # ==========================================================
-    # TẦNG 2: GHÉP GỘP ĐÚNG TIỀN (Bản nâng cấp chống sập Server)
+    # TẦNG 2: GHÉP GỘP CỰC TỐC ĐỘ (Thuật toán tối ưu không sập)
     # ==========================================================
     for b in bank_records:
         if b['matched']: continue
@@ -54,22 +56,28 @@ def match_transactions(bank_records, acc_records):
             if not a['matched'] and a['date'] == b['date'] and a['tx_type'] == b['tx_type']:
                 score = compare_strings(b['desc'], a['desc'])
                 if score > 60 or (a['ref'] and b['ref'] and a['ref'] == b['ref']):
-                    # Lưu lại điểm số để lọc
+                    # Lưu kèm điểm số để không phải tính lại nữa
                     related_accs.append((score, a))
                     
         if not related_accs: continue
         
-        # GIẢI PHÁP TỐI ƯU: Chấm điểm và CHỈ LẤY TỐI ĐA 12 DÒNG GIỐNG NHẤT
-        # Giảm số phép tính từ hàng triệu xuống chỉ còn < 792 phép tính
         related_accs.sort(key=lambda x: x[0], reverse=True)
-        top_candidates = [x[1] for x in related_accs[:12]]
+        # Chỉ lấy Top 8 dòng giống nhất để thử ghép (tối ưu hóa cực độ)
+        top_candidates = related_accs[:8]
         
+        # CHỐNG TRÀN BỘ NHỚ: Nếu gom tất cả ứng viên mà tiền vẫn nhỏ hơn ngân hàng -> Bỏ qua!
+        if sum(item[1]['amount'] for item in top_candidates) < b['amount']:
+            continue
+            
         valid_combos = []
-        for r in range(2, min(6, len(top_candidates) + 1)):
+        # Chỉ thử ghép tối đa 4 dòng lại với nhau (Cực kỳ nhẹ máy)
+        for r in range(2, min(5, len(top_candidates) + 1)):
             for combo in itertools.combinations(top_candidates, r):
-                if sum(item['amount'] for item in combo) == b['amount']:
-                    avg_score = sum(compare_strings(b['desc'], item['desc']) for item in combo) / r
-                    valid_combos.append((avg_score, combo))
+                if sum(item[1]['amount'] for item in combo) == b['amount']:
+                    # Tính điểm trung bình từ điểm ĐÃ LƯU, không tính lại chuỗi!
+                    avg_score = sum(item[0] for item in combo) / r
+                    matched_accs = [item[1] for item in combo]
+                    valid_combos.append((avg_score, matched_accs))
                     
         if valid_combos:
             valid_combos.sort(key=lambda x: x[0], reverse=True)
@@ -82,7 +90,9 @@ def match_transactions(bank_records, acc_records):
             combo_rows_str = ", ".join([str(a['row']) for a in matched_combo])
             results.append(create_result_row('ĐÚNG', b, virtual_acc, best_score, f'GỘP {len(matched_combo)} DÒNG KẾ TOÁN (Dòng {combo_rows_str}) => TỔNG TIỀN KHỚP 100%'))
 
-    # TẦNG 3: NHẦM NỢ/CÓ
+    # ==========================================================
+    # TẦNG 3, 4, 5, 6 CÒN LẠI (GIỮ NGUYÊN)
+    # ==========================================================
     for b in bank_records:
         if b['matched']: continue
         for a in acc_records:
@@ -94,7 +104,6 @@ def match_transactions(bank_records, acc_records):
                     results.append(create_result_row('NHẦM NỢ/CÓ', b, a, score, 'LỖI KẾ TOÁN: Hạch toán ngược chiều Nợ/Có'))
                     break
 
-    # TẦNG 4: LỆCH NGÀY
     for b in bank_records:
         if b['matched']: continue
         candidates = []
@@ -112,7 +121,6 @@ def match_transactions(bank_records, acc_records):
                 best_acc['matched'] = True
                 results.append(create_result_row('LỆCH NGÀY', b, best_acc, best_score, f'LỖI KẾ TOÁN: Sai ngày (lệch {day_diff} ngày)'))
 
-    # TẦNG 5: SAI SỐ TIỀN & GỘP LỆCH TIỀN
     for b in bank_records:
         if b['matched']: continue
         
@@ -147,7 +155,6 @@ def match_transactions(bank_records, acc_records):
                 
                 results.append(create_result_row('SAI SỐ TIỀN', b, virtual_acc, avg_score, msg))
 
-    # TẦNG 6: NHẬP THIẾU, DƯ, TRÙNG
     matched_acc_amounts_dates = [(a['date'], a['amount']) for a in acc_records if a['matched']]
     
     for b in bank_records:
