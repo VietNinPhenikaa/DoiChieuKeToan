@@ -1,177 +1,131 @@
-import itertools
+from collections import defaultdict
+from itertools import combinations
 from rapidfuzz import fuzz
 
-def compare_strings(s1, s2):
-    if not s1 and not s2: return 100
-    if not s1 or not s2: return 0
-    return fuzz.token_sort_ratio(str(s1).lower(), str(s2).lower())
-
-def create_virtual_acc(records):
-    combo_rows = ", ".join([str(a['row']) for a in records])
-    unique_raw_descs = list(dict.fromkeys([a['raw_desc'] for a in records]))
+def build_indices(df, prefix):
+    # Index bằng lượng tiền và hướng dòng tiền
+    idx_amt = defaultdict(list)
+    idx_first10 = defaultdict(list)
     
-    return {
-        'row': combo_rows,
-        'date': records[0]['date'],
-        'ref': ', '.join(set([a['ref'] for a in records if a['ref']])),
-        'desc': records[0]['desc'],
-        'raw_desc': "\n".join(unique_raw_descs),
-        'debit': sum([a['debit'] for a in records]),
-        'credit': sum([a['credit'] for a in records]),
-        'amount': sum([a['amount'] for a in records]),
-        'tx_type': records[0]['tx_type']
-    }
-
-def match_transactions(bank_records, acc_records):
-    results = []
-
-    # ==========================================
-    # TẦNG 1: KHỚP 1-1 (Sai số ngày <= 3, Cùng tiền)
-    # ==========================================
-    for b in bank_records:
-        if b['matched']: continue
-        candidates = []
-        for a in acc_records:
-            if not a['matched'] and b['tx_type'] == a['tx_type'] and b['amount'] == a['amount']:
-                day_diff = abs((b['date'] - a['date']).days)
-                if day_diff <= 3:
-                    score = compare_strings(b['desc'], a['desc'])
-                    candidates.append((score, a, day_diff))
+    for _, row in df.iterrows():
+        r_dict = row.to_dict()
+        r_dict['_type'] = prefix
         
+        amt_dir_key = (r_dict['amount'], r_dict['direction'])
+        idx_amt[amt_dir_key].append(r_dict)
+        
+        f10_dir_key = (r_dict['first10'], r_dict['direction'])
+        idx_first10[f10_dir_key].append(r_dict)
+        
+    return idx_amt, idx_first10
+
+def find_subset_combinations(items, target_sum, max_len=4):
+    valid_combos = []
+    for r in range(1, min(max_len + 1, len(items) + 1)):
+        for combo in combinations(items, r):
+            if abs(sum(x['amount'] for x in combo) - target_sum) < 1.0:
+                valid_combos.append(list(combo))
+    return valid_combos
+
+def check_group_match(bank_group, acc_group):
+    # Trọng số match dựa trên First10 hoặc mô tả
+    b_text = " ".join([x['norm_desc'] for x in bank_group])
+    a_text = " ".join([x['norm_desc'] for x in acc_group])
+    
+    b_first10s = set([x['first10'] for x in bank_group])
+    a_first10s = set([x['first10'] for x in acc_group])
+    
+    if b_first10s & a_first10s: 
+        return True # Khớp tín hiệu mạnh
+        
+    if fuzz.token_set_ratio(b_text, a_text) > 70:
+        return True
+        
+    return False
+
+def match_transactions(df_bank, df_acc):
+    matched_groups = []
+    
+    # 1. Chuyển thành list dict và theo dõi matched
+    banks = df_bank.to_dict('records')
+    accs = df_acc.to_dict('records')
+    
+    matched_bank_ids = set()
+    matched_acc_ids = set()
+    
+    def add_match(b_items, a_items, match_type):
+        for b in b_items: matched_bank_ids.add(b['id'])
+        for a in a_items: matched_acc_ids.add(a['id'])
+        matched_groups.append({
+            'bank': b_items,
+            'acc': a_items,
+            'type': match_type
+        })
+
+    # === BƯỚC 1: EXACT MATCH 1-1 (Nhanh nhất) ===
+    # Gom nhóm theo Amount + Direction + First10
+    idx_acc_exact = defaultdict(list)
+    for a in accs:
+        idx_acc_exact[(a['amount'], a['direction'], a['first10'])].append(a)
+        
+    for b in banks:
+        key = (b['amount'], b['direction'], b['first10'])
+        candidates = [a for a in idx_acc_exact[key] if a['id'] not in matched_acc_ids]
         if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_acc, day_diff = candidates[0]
-            if best_score >= 50 or len(candidates) == 1:
-                b['matched'] = True
-                best_acc['matched'] = True
-                msg = 'Khớp 1-1 chính xác' if day_diff == 0 else f'Khớp 1-1 (Lệch {day_diff} ngày)'
-                results.append(create_result_row('ĐÚNG', b, best_acc, best_score, msg))
+            c = candidates[0]
+            add_match([b], [c], "Khớp 1-1")
 
-    # ==========================================
-    # TẦNG 2: GỘP 1-N XUYÊN NGÀY (Lệch <= 3 ngày) - SIÊU TỐC ĐỘ
-    # ==========================================
-    for b in bank_records:
-        if b['matched']: continue
-        
-        # 1. Tìm ứng viên: Cùng chiều, Lệch <= 3 ngày, Nội dung có nét tương đồng
-        candidates_raw = []
-        for a in acc_records:
-            if not a['matched'] and b['tx_type'] == a['tx_type']:
-                day_diff = abs((b['date'] - a['date']).days)
-                if day_diff <= 3:
-                    score = compare_strings(b['desc'], a['desc'])
-                    if score > 55 or (a['ref'] and b['ref'] and a['ref'] == b['ref']):
-                        candidates_raw.append((score, a))
-                        
-        if not candidates_raw: continue
-        
-        # 2. BỘ LỌC CHỐNG SẬP: Chỉ lấy Top 10 dòng giống nhất để tính tổ hợp
-        candidates_raw.sort(key=lambda x: x[0], reverse=True)
-        top_candidates = [x[1] for x in candidates_raw[:10]]
-        
-        # 3. BỘ LỌC CHỐNG CHẠY THỪA: Nếu tổng 10 dòng này < tiền Sổ phụ -> Bỏ qua ngay
-        if sum(a['amount'] for a in top_candidates) < b['amount']:
-            continue
+    # === BƯỚC 2: FUZZY 1-1 (Dựa trên Số tiền + Hướng, xét token) ===
+    idx_acc_amt = defaultdict(list)
+    for a in accs:
+        if a['id'] not in matched_acc_ids:
+            idx_acc_amt[(a['amount'], a['direction'])].append(a)
             
-        # 4. Tính chập 2 -> 5 (Dù duyệt qua nhiều ngày vẫn chỉ mất mili-giây)
-        valid_combos = []
-        for r in range(2, min(6, len(top_candidates) + 1)):
-            for combo in itertools.combinations(top_candidates, r):
-                if sum(a['amount'] for a in combo) == b['amount']:
-                    avg_score = sum(compare_strings(b['desc'], a['desc']) for a in combo) / r
-                    valid_combos.append((avg_score, combo))
-                    
-        if valid_combos:
-            valid_combos.sort(key=lambda x: x[0], reverse=True)
-            best_score, matched_combo = valid_combos[0]
-            
-            b['matched'] = True
-            for a in matched_combo: a['matched'] = True
-            v_acc = create_virtual_acc(matched_combo)
-            
-            # Ghi chú ĐÚNG và liệt kê rõ những dòng đã ghép
-            combo_rows_str = ", ".join([str(a['row']) for a in matched_combo])
-            results.append(create_result_row('ĐÚNG', b, v_acc, best_score, f'Gộp {len(matched_combo)} dòng (Dòng kế toán: {combo_rows_str}) => Tổng tiền khớp 100%'))
-
-    # ==========================================
-    # TẦNG 3: NHẦM NỢ/CÓ (Lệch <= 3 ngày)
-    # ==========================================
-    for b in bank_records:
-        if b['matched']: continue
-        for a in acc_records:
-            if not a['matched'] and b['amount'] == a['amount'] and b['tx_type'] != a['tx_type']:
-                day_diff = abs((b['date'] - a['date']).days)
-                if day_diff <= 3:
-                    score = compare_strings(b['desc'], a['desc'])
-                    if score >= 60:
-                        b['matched'] = True
-                        a['matched'] = True
-                        results.append(create_result_row('NHẦM NỢ/CÓ', b, a, score, 'Lỗi hạch toán ngược chiều Nợ/Có'))
-                        break
-
-    # ==========================================
-    # TẦNG 4: SAI SỐ TIỀN (Gộp nhiều dòng bị thiếu/thừa tiền)
-    # ==========================================
-    for b in bank_records:
-        if b['matched']: continue
+    for b in banks:
+        if b['id'] in matched_bank_ids: continue
+        key = (b['amount'], b['direction'])
+        candidates = [a for a in idx_acc_amt[key] if a['id'] not in matched_acc_ids]
         
-        candidates_raw = []
-        for a in acc_records:
-            if not a['matched'] and b['tx_type'] == a['tx_type']:
-                day_diff = abs((b['date'] - a['date']).days)
-                if day_diff <= 3:
-                    score = compare_strings(b['desc'], a['desc'])
-                    if score >= 75 or (a['ref'] and b['ref'] and a['ref'] == b['ref']):
-                        candidates_raw.append(a)
-                        
-        if candidates_raw:
-            b['matched'] = True
-            for a in candidates_raw: a['matched'] = True
+        best_candidate = None
+        best_score = 0
+        for c in candidates:
+            score = fuzz.token_set_ratio(b['norm_desc'], c['norm_desc'])
+            if score > 75 and score > best_score:
+                best_score = score
+                best_candidate = c
                 
-            if len(candidates_raw) == 1:
-                a = candidates_raw[0]
-                diff = abs(b['amount'] - a['amount'])
-                msg = f"Nhập thiếu {diff:,.0f}" if b['amount'] > a['amount'] else f"Nhập thừa {diff:,.0f}"
-                results.append(create_result_row('SAI SỐ TIỀN', b, a, compare_strings(b['desc'], a['desc']), msg))
-            else:
-                v_acc = create_virtual_acc(candidates_raw)
-                diff = abs(b['amount'] - v_acc['amount'])
-                avg_score = sum(compare_strings(b['desc'], a['desc']) for a in candidates_raw) / len(candidates_raw)
+        if best_candidate:
+            add_match([b], [best_candidate], "Khớp 1-1 (Tương đồng diễn giải)")
+
+    # === BƯỚC 3: GROUP MATCHING N-M (Giới hạn tối đa 4 dòng) ===
+    # Nhóm các dòng chưa match theo First10 và Direction
+    idx_b_first10 = defaultdict(list)
+    idx_a_first10 = defaultdict(list)
+    
+    for b in banks:
+        if b['id'] not in matched_bank_ids:
+            idx_b_first10[(b['first10'], b['direction'])].append(b)
+    for a in accs:
+        if a['id'] not in matched_acc_ids:
+            idx_a_first10[(a['first10'], a['direction'])].append(a)
+            
+    for key, b_list in idx_b_first10.items():
+        a_list = idx_a_first10.get(key, [])
+        if not a_list: continue
+        
+        # Thử vét cạn tổ hợp nhỏ trong nhóm có chung First10
+        for i in range(1, min(5, len(b_list) + 1)):
+            for b_combo in combinations([x for x in b_list if x['id'] not in matched_bank_ids], i):
+                target_sum = sum(x['amount'] for x in b_combo)
+                a_avail = [x for x in a_list if x['id'] not in matched_acc_ids]
+                a_combos = find_subset_combinations(a_avail, target_sum, max_len=4)
                 
-                combo_rows_str = ", ".join([str(a['row']) for a in candidates_raw])
-                msg = f"Nhập thiếu {diff:,.0f}" if b['amount'] > v_acc['amount'] else f"Nhập thừa {diff:,.0f}"
-                msg = f"Gộp {len(candidates_raw)} dòng (Dòng {combo_rows_str}) nhưng vẫn {msg.lower()}"
-                
-                results.append(create_result_row('SAI SỐ TIỀN', b, v_acc, avg_score, msg))
+                if a_combos:
+                    best_a_combo = a_combos[0]
+                    add_match(b_combo, best_a_combo, f"Khớp {len(b_combo)}-{len(best_a_combo)}")
 
-    # ==========================================
-    # TẦNG 5: NHẬP DƯ, NHẬP THIẾU
-    # ==========================================
-    for b in bank_records:
-        if not b['matched']:
-            results.append(create_result_row('NHẬP THIẾU', b, None, 0, 'Chưa hạch toán'))
-    for a in acc_records:
-        if not a['matched']:
-            results.append(create_result_row('NHẬP DƯ', None, a, 0, 'Nhập khống / Sai số quá xa'))
-
-    return results
-
-def create_result_row(status, bank, acc, score=0, note=""):
-    return {
-        'status': status,
-        'b_row': bank['row'] if bank else '',
-        'a_row': acc['row'] if acc else '',
-        'b_date': bank['date'].strftime('%d/%m/%Y') if bank else '',
-        'a_date': acc['date'].strftime('%d/%m/%Y') if acc else '',
-        'b_ref': bank['ref'] if bank else '',
-        'a_ref': acc['ref'] if acc else '',
-        'b_desc': bank['raw_desc'] if bank else '',
-        'a_desc': acc['raw_desc'] if acc else '',
-        'b_debit': bank['debit'] if bank else 0,
-        'b_credit': bank['credit'] if bank else 0,
-        'a_debit': acc['debit'] if acc else 0,
-        'a_credit': acc['credit'] if acc else 0,
-        'diff': abs((bank['amount'] if bank else 0) - (acc['amount'] if acc else 0)),
-        'score': round(score, 1),
-        'note': note
-    }
+    # Trả về kết quả
+    unmatched_bank = [b for b in banks if b['id'] not in matched_bank_ids]
+    unmatched_acc = [a for a in accs if a['id'] not in matched_acc_ids]
+    
+    return matched_groups, unmatched_bank, unmatched_acc

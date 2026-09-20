@@ -1,129 +1,137 @@
 import pandas as pd
-from services.normalizer import clean_string, parse_date, parse_amount
+import os
+import traceback
+from .normalizer import normalize_text, get_first10, extract_amount
 
-def try_map_columns(col_names):
-    mapping = {'date': None, 'desc': None, 'debit': None, 'credit': None, 'ref': None}
-    kw_map = {
-        'date': ['ngày', 'date', 'thời gian', 'time'],
-        'desc': ['diễn giải', 'nội dung', 'mô tả', 'chi tiết', 'description', 'transaction description'],
-        'debit': ['ghi nợ', 'phát sinh nợ', 'nợ', 'debit', 'ps nợ'],
-        'credit': ['ghi có', 'phát sinh có', 'có', 'credit', 'ps có'],
-        'ref': ['số tham chiếu', 'mã giao dịch', 'số giao dịch', 'số chứng từ', 'chứng từ', 'số ct', 'transaction number', 'ref', 'số']
+def read_smart_excel(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    if ext == '.xls':
+        with open(file_path, 'rb') as f:
+            header_bytes = f.read(1024).lower()
+            if b'<html' in header_bytes or b'<table' in header_bytes or b'<!doctype' in header_bytes or b'xml' in header_bytes:
+                try:
+                    dfs = pd.read_html(file_path)
+                    return dfs[0] if dfs else pd.DataFrame()
+                except Exception as e:
+                    raise Exception(f"Lỗi đọc file giả HTML: {str(e)}")
+                    
+    engines = {
+        '.xlsx': 'openpyxl',
+        '.xlsm': 'openpyxl',
+        '.xlsb': 'pyxlsb',
+        '.xls': 'xlrd',
+        '.ods': 'odf',
     }
     
-    for key, kws in kw_map.items():
-        for kw in kws:
-            for i, col_name in enumerate(col_names):
-                if any(bad in col_name for bad in ['số dư', 'dư đầu', 'dư cuối', 'tổng']): 
-                    continue
-                if kw in col_name and mapping[key] is None:
-                    mapping[key] = i
-                    break
-            if mapping[key] is not None: 
-                break
-    
-    score = 0
-    if mapping['date'] is not None: score += 10
-    if mapping['desc'] is not None: score += 10
-    if mapping['debit'] is not None: score += 10
-    if mapping['credit'] is not None: score += 10
-    if mapping['ref'] is not None: score += 5
-    return score, mapping
+    if ext == '.csv':
+        return pd.read_csv(file_path)
+        
+    engine = engines.get(ext, None)
+    return pd.read_excel(file_path, engine=engine, header=None)
 
-def identify_header_and_columns(df):
-    best_score = -1
-    best_mapping = None
-    best_row_idx = 0 
+def extract_data_with_mapping(df, col_mapping, file_type):
+    if df.empty:
+        raise ValueError(f"File [{file_type}] không có dữ liệu.")
+        
+    df_cleaned = df.dropna(how='all').reset_index(drop=True)
     
-    for i in range(min(35, len(df))):
-        # 1. Thử quét dòng đơn lẻ
-        row1 = df.iloc[i].fillna('')
-        col_names_single = [str(x).strip().lower() for x in row1.values]
-        score_single, map_single = try_map_columns(col_names_single)
-        if score_single > best_score:
-            best_score = score_single
-            best_mapping = map_single
-            best_row_idx = i
-            
-        # 2. Thử quét ghép dòng
-        if i + 1 < len(df):
-            row2 = df.iloc[i+1].fillna('')
-            col_names_comb = [(str(row1.iloc[j]) + ' ' + str(row2.iloc[j])).strip().lower() for j in range(len(df.columns))]
-            score_comb, map_comb = try_map_columns(col_names_comb)
-            
-            if score_comb > best_score:
-                best_score = score_comb
-                best_mapping = map_comb
-                best_row_idx = i + 1 
+    if df_cleaned.empty:
+        raise ValueError(f"File [{file_type}] chỉ toàn các dòng rỗng.")
+
+    best_mapping = {}
+    max_header_row = -1
+
+    # Quét DỌC từng cột để tìm tên cột (Hỗ trợ cấu trúc Header 2-3 dòng của file Kế toán)
+    for std_col, possible_names in col_mapping.items():
+        norm_possible = [normalize_text(n) for n in possible_names]
+        found = False
+        
+        for col_idx in range(df_cleaned.shape[1]):
+            if col_idx in best_mapping.values():
+                continue # Cột này đã map vào trường khác, bỏ qua
                 
-    final_mapping = {k: df.columns[v] if v is not None else None for k, v in best_mapping.items()}
-    return best_row_idx, final_mapping
+            # Quét 20 dòng đầu của cột này
+            for row_idx in range(min(20, df_cleaned.shape[0])):
+                val = df_cleaned.iloc[row_idx, col_idx]
+                if pd.isna(val) or str(val).strip() == '':
+                    continue
+                    
+                norm_val = normalize_text(str(val))
+                
+                # Ưu tiên match chính xác trước, nếu không thì match chứa (in)
+                if any(pn == norm_val for pn in norm_possible if pn) or any(pn in norm_val for pn in norm_possible if pn):
+                    best_mapping[std_col] = col_idx
+                    max_header_row = max(max_header_row, row_idx) # Đẩy dòng bắt đầu dữ liệu xuống dưới cùng
+                    found = True
+                    break 
+                    
+            if found:
+                break 
 
-def read_excel_robust(filepath):
-    try:
-        return pd.read_excel(filepath, header=None, engine='xlrd')
-    except: pass
-        
-    try:
-        return pd.read_excel(filepath, header=None, engine='openpyxl')
-    except: pass
-        
-    try:
-        dfs = pd.read_html(filepath)
-        if dfs: return dfs[0]
-    except: pass
-        
-    try:
-        return pd.read_excel(filepath, header=None)
-    except Exception as e:
-        raise ValueError("File hỏng định dạng. Vui lòng mở bằng Excel rồi Save As (.xlsx) để thử lại.")
+    if 'date' not in best_mapping or 'description' not in best_mapping:
+        debug_info = df_cleaned.head(10).to_string()
+        raise ValueError(f"Không xác định được cột ở file [{file_type}].\nMapping tìm được: {best_mapping}\n\nDữ liệu 10 dòng đầu:\n{debug_info}")
 
-def read_and_normalize(filepath, is_bank=True):
-    df = read_excel_robust(filepath)
-    header_idx, mapping = identify_header_and_columns(df)
+    # Dữ liệu thật sự bắt đầu ngay dưới dòng header thấp nhất được tìm thấy
+    data_rows = df_cleaned.iloc[max_header_row + 1:].copy()
+    result_df = pd.DataFrame()
     
-    # ĐÃ SỬA LỖI PYTHON INDEX 0 Ở ĐÂY:
-    if None in (mapping['date'], mapping['desc'], mapping['debit'], mapping['credit']):
-        raise ValueError(f"Không thể nhận diện các cột cơ bản. Các cột tìm thấy: {mapping}")
-        
-    records = []
-    start_row = header_idx + 1
-    
-    for idx in range(start_row, len(df)):
-        row = df.iloc[idx]
-        row_num = idx + 1 
-        
-        date_val = parse_date(row[mapping['date']])
-        if date_val is None: continue 
-        
-        raw_desc = str(row[mapping['desc']]) if pd.notna(row[mapping['desc']]) else ""
-        desc_val = clean_string(raw_desc)
-        
-        debit_val = parse_amount(row[mapping['debit']])
-        credit_val = parse_amount(row[mapping['credit']])
-        
-        # ĐÃ SỬA LỖI PYTHON INDEX 0 Ở ĐÂY:
-        ref_val = str(row[mapping['ref']]) if mapping['ref'] is not None and pd.notna(row[mapping['ref']]) else ""
-        
-        if debit_val == 0 and credit_val == 0: continue
-        
-        amount = max(debit_val, credit_val)
-        if is_bank:
-            tx_type = 'IN' if credit_val > 0 else 'OUT'
+    for std_col in col_mapping.keys():
+        if std_col in best_mapping:
+            result_df[std_col] = data_rows.iloc[:, best_mapping[std_col]]
         else:
-            tx_type = 'IN' if debit_val > 0 else 'OUT'
-            
-        records.append({
-            'row': row_num,
-            'date': date_val,
-            'desc': desc_val,
-            'raw_desc': raw_desc,
-            'debit': debit_val,
-            'credit': credit_val,
-            'ref': ref_val,
-            'amount': amount,
-            'tx_type': tx_type,
-            'matched': False,
-            'raw_row': row.to_dict()
-        })
-    return records
+            if std_col in ['debit', 'credit']:
+                result_df[std_col] = 0.0
+            else:
+                result_df[std_col] = ""
+
+    result_df['debit'] = result_df['debit'].apply(extract_amount)
+    result_df['credit'] = result_df['credit'].apply(extract_amount)
+    result_df['amount'] = result_df.apply(lambda x: x['credit'] if x['credit'] > 0 else x['debit'], axis=1)
+    
+    result_df['norm_desc'] = result_df['description'].apply(normalize_text)
+    result_df['first10'] = result_df['norm_desc'].apply(get_first10)
+    
+    # Hàm loại bỏ các dòng siêu dữ liệu kế toán (Dư đầu, Dư cuối, Tổng cộng)
+    def is_valid_transaction(desc):
+        if pd.isna(desc): return False
+        d = str(desc).lower().strip()
+        if not d: return False
+        if 'dư đầu' in d or 'dư cuối' in d or 'tổng cộng' in d or 'cộng phát sinh' in d:
+            return False
+        return True
+
+    # Lọc dữ liệu hợp lệ
+    result_df = result_df[
+        (result_df['amount'] > 0) & 
+        (result_df['description'].apply(is_valid_transaction))
+    ].copy()
+    
+    result_df['id'] = range(1, len(result_df) + 1)
+    
+    return result_df
+
+def read_bank_file(file_path):
+    df = read_smart_excel(file_path)
+    col_mapping = {
+        'date': ['ngày giao dịch', 'ngày hạch toán', 'ngày', 'transaction date', 'accounting date'],
+        'description': ['mô tả giao dịch', 'mô tả', 'nội dung', 'diễn giải', 'transaction description', 'details'],
+        'debit': ['số tiền ghi nợ', 'phát sinh nợ', 'nợ', 'debit'],
+        'credit': ['số tiền ghi có', 'phát sinh có', 'có', 'credit']
+    }
+    standard_df = extract_data_with_mapping(df, col_mapping, "NGÂN HÀNG")
+    standard_df['direction'] = standard_df.apply(lambda x: 1 if x['credit'] > 0 else -1, axis=1)
+    return standard_df
+
+def read_accounting_file(file_path):
+    df = read_smart_excel(file_path)
+    col_mapping = {
+        'date': ['ngày chứng từ', 'ngày hạch toán', 'ngày', 'date'],
+        'description': ['diễn giải', 'nội dung', 'mô tả', 'description'],
+        'debit': ['phát sinh nợ', 'nợ', 'debit'],
+        'credit': ['phát sinh có', 'có', 'credit']
+    }
+    standard_df = extract_data_with_mapping(df, col_mapping, "KẾ TOÁN")
+    standard_df['direction'] = standard_df.apply(lambda x: 1 if x['debit'] > 0 else -1, axis=1)
+    return standard_df

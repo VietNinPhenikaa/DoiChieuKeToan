@@ -1,87 +1,108 @@
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.utils import get_column_letter
 
-# Cấu hình màu sắc trạng thái
-COLORS = {
-    'ĐÚNG': 'C6EFCE', 'NHẬP THIẾU': 'FFC7CE', 'NHẬP DƯ': 'FFEB9C',
-    'SAI SỐ TIỀN': 'FF9999', 'NHẦM NỢ/CÓ': 'FFCC99', 
-    'LỆCH NGÀY': 'B4C6E7', 'NHẬP TRÙNG': 'E2EFDA'
-}
-
-def export_results(results, bank_total, acc_total, output_path):
-    wb = Workbook()
+def format_sheet(ws):
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    header_font = Font(bold=True)
     
-    df_results = pd.DataFrame(results)
-    
-    # --- Sheet 1: TỔNG HỢP ---
-    ws_summary = wb.active
-    ws_summary.title = "TONG_HOP"
-    
-    summary_data = [
-        ["CHỈ TIÊU", "SỐ LƯỢNG", "GIÁ TRỊ TIỀN"],
-        ["Tổng GD Sổ phụ", bank_total, ""],
-        ["Tổng GD File nhập", acc_total, ""],
-        ["GD ĐÚNG", len(df_results[df_results['status'] == 'ĐÚNG']), ""],
-        ["GD NHẬP THIẾU", len(df_results[df_results['status'] == 'NHẬP THIẾU']), df_results[df_results['status'] == 'NHẬP THIẾU']['b_credit'].sum() + df_results[df_results['status'] == 'NHẬP THIẾU']['b_debit'].sum()],
-        ["GD NHẬP DƯ", len(df_results[df_results['status'] == 'NHẬP DƯ']), df_results[df_results['status'] == 'NHẬP DƯ']['a_credit'].sum() + df_results[df_results['status'] == 'NHẬP DƯ']['a_debit'].sum()],
-        ["GD SAI SỐ TIỀN", len(df_results[df_results['status'] == 'SAI SỐ TIỀN']), ""],
-        ["GD NHẦM NỢ/CÓ", len(df_results[df_results['status'] == 'NHẦM NỢ/CÓ']), ""],
-        ["GD NHẬP TRÙNG", len(df_results[df_results['status'] == 'NHẬP TRÙNG']), ""],
-        ["GD LỆCH NGÀY", len(df_results[df_results['status'] == 'LỆCH NGÀY']), ""]
-    ]
-    
-    for row in summary_data:
-        ws_summary.append(row)
+    # Format header
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         
-    ws_summary.column_dimensions['A'].width = 25
-    ws_summary.column_dimensions['B'].width = 15
-    ws_summary.column_dimensions['C'].width = 25
-    for cell in ws_summary["1:1"]: cell.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     
-    # --- Function hỗ trợ ghi Sheet ---
-    def write_sheet(ws, df_subset):
-        headers = ["STT", "Trạng thái", "Dòng SP", "Dòng KT", "Ngày SP", "Ngày KT", 
-                   "Mã SP", "Mã KT", "Nội dung Sổ phụ", "Nội dung File KT", 
-                   "NỢ (SP)", "CÓ (SP)", "NỢ (KT)", "CÓ (KT)", "Chênh lệch", "Độ giống (%)", "Nhận xét"]
-        ws.append(headers)
-        
-        for idx, row in enumerate(df_subset.itertuples(index=False), 1):
-            ws.append((idx, *row))
-            
-        # Formatting
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        
-        # Format Width & Number
-        for col in range(1, 18):
-            ws.column_dimensions[ws.cell(1, col).column_letter].width = 15
-        ws.column_dimensions['I'].width = 40
-        ws.column_dimensions['J'].width = 40
-        ws.column_dimensions['Q'].width = 30
-        
-        for row_idx in range(2, ws.max_row + 1):
-            status = ws.cell(row=row_idx, column=2).value
-            if status in COLORS:
-                for col_idx in range(1, 18):
-                    ws.cell(row=row_idx, column=col_idx).fill = PatternFill(start_color=COLORS[status], end_color=COLORS[status], fill_type="solid")
-            
-            # Format tiền (Cột 11 đến 15)
-            for col_idx in range(11, 16):
-                ws.cell(row=row_idx, column=col_idx).number_format = '#,##0'
+    # Auto-adjust column width and number formats
+    for col in ws.columns:
+        max_length = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '#,##0'
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+            # Wrap text cho diễn giải và ghi chú
+            if cell.row > 1 and ws.cell(row=1, column=cell.column).value in ['Diễn giải', 'Diễn giải ngân hàng', 'Diễn giải kế toán', 'Ghi chú']:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
                 
-        for cell in ws["1:1"]: cell.font = Font(bold=True)
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[col_letter].width = adjusted_width
 
-    # --- Sheet 2: SAI_LECH ---
-    ws_diff = wb.create_sheet("SAI_LECH")
-    df_diff = df_results[df_results['status'] != 'ĐÚNG']
-    write_sheet(ws_diff, df_diff)
-
-    # --- Sheet 3: DOI_CHIEU_DUNG ---
-    ws_correct = wb.create_sheet("DOI_CHIEU_DUNG")
-    df_correct = df_results[df_results['status'] == 'ĐÚNG']
-    write_sheet(ws_correct, df_correct)
-
-    wb.save(output_path)
-    return summary_data
+def export_results(matched_groups, unmatched_bank, unmatched_acc, output_path):
+    # --- SHEET KHOP ---
+    khop_rows = []
+    for grp in matched_groups:
+        b_len = len(grp['bank'])
+        a_len = len(grp['acc'])
+        
+        bank_total = sum(b['amount'] for b in grp['bank'])
+        bank_desc_concat = " | ".join([b['description'] for b in grp['bank']])
+        note = f"{grp['type']}. {b_len} giao dịch ngân hàng đối ứng với {a_len} dòng kế toán."
+        
+        # Ghi đầy đủ các dòng kế toán vào sheet KHOP
+        for a in grp['acc']:
+            khop_rows.append({
+                'Ngày': a['date'],
+                'Diễn giải': a['description'],  # Diễn giải gốc
+                'Nợ': a['debit'],
+                'Có': a['credit'],
+                'Đối ứng ngân hàng': bank_total,
+                'Trạng thái': grp['type'],
+                'Ghi chú': note
+            })
+            
+    df_khop = pd.DataFrame(khop_rows)
+    
+    # --- SHEET KHONG_KHOP ---
+    khong_khop_rows = []
+    
+    # Xử lý ngân hàng thừa (không có kế toán đối ứng)
+    for b in unmatched_bank:
+        khong_khop_rows.append({
+            'Ngày ngân hàng': b['date'],
+            'Diễn giải ngân hàng': b['description'],
+            'Tiền ngân hàng': b['amount'],
+            'Ngày kế toán': '',
+            'Diễn giải kế toán': '',
+            'Tiền kế toán': 0,
+            'Chênh lệch': b['amount'],
+            'Trạng thái': 'Chưa nhập / Ngân hàng thừa',
+            'Ghi chú': 'Đã dò nhưng không tìm thấy dòng kế toán phù hợp. Khả năng giao dịch này chưa được hạch toán.'
+        })
+        
+    # Xử lý kế toán thừa (không có ngân hàng đối ứng)
+    for a in unmatched_acc:
+        khong_khop_rows.append({
+            'Ngày ngân hàng': '',
+            'Diễn giải ngân hàng': '',
+            'Tiền ngân hàng': 0,
+            'Ngày kế toán': a['date'],
+            'Diễn giải kế toán': a['description'],
+            'Tiền kế toán': a['amount'],
+            'Chênh lệch': -a['amount'],
+            'Trạng thái': 'Thừa / Kế toán đã ghi',
+            'Ghi chú': 'Đã dò nhưng không tìm thấy giao dịch ngân hàng tương ứng. Cần kiểm tra lại chứng từ hoặc hạch toán nhầm.'
+        })
+        
+    df_khong_khop = pd.DataFrame(khong_khop_rows)
+    
+    # Ghi Excel
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        if not df_khop.empty:
+            df_khop.to_excel(writer, sheet_name='KHOP', index=False)
+        else:
+            pd.DataFrame(columns=['Ngày', 'Diễn giải', 'Nợ', 'Có', 'Đối ứng ngân hàng', 'Trạng thái', 'Ghi chú']).to_excel(writer, sheet_name='KHOP', index=False)
+            
+        if not df_khong_khop.empty:
+            df_khong_khop.to_excel(writer, sheet_name='KHONG_KHOP', index=False)
+        else:
+            pd.DataFrame(columns=['Ngày ngân hàng', 'Diễn giải ngân hàng', 'Tiền ngân hàng', 'Ngày kế toán', 'Diễn giải kế toán', 'Tiền kế toán', 'Chênh lệch', 'Trạng thái', 'Ghi chú']).to_excel(writer, sheet_name='KHONG_KHOP', index=False)
+            
+        format_sheet(writer.sheets['KHOP'])
+        format_sheet(writer.sheets['KHONG_KHOP'])
